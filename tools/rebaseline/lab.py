@@ -1,0 +1,195 @@
+"""Offline re-baseline experiment: inventory, build, verify and compare.
+
+Run with the factory's Python environment and PYTHONPATH=src. No publication
+or upstream lookup occurs in this module. Inputs must be frozen beforehand.
+"""
+import argparse
+import hashlib
+import json
+import platform
+import importlib.metadata
+import shutil
+import subprocess
+import time
+import zipfile
+from pathlib import Path, PurePosixPath
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def inventory(root):
+    return {p.relative_to(root).as_posix(): {'bytes': p.stat().st_size, 'sha256': digest(p)}
+            for p in sorted(root.rglob('*')) if p.is_file()}
+
+
+def save(path, value):
+    with path.open('x', encoding='utf-8') as stream:
+        json.dump(value, stream, indent=2, ensure_ascii=False)
+        stream.write('\n')
+
+
+def freeze(cache, excel, output):
+    from akdp.images_fetch import _safe_filename
+    info = json.loads((cache / 'hashes.json').read_text())
+    if not info.get('versionId') or not info.get('hashes'):
+        raise ValueError('Missing version or bundle manifest')
+    expected = {_safe_filename(name) for name in info['hashes']}
+    missing = sorted(name for name in expected if not (cache / name).is_file())
+    if missing:
+        raise ValueError(f'Incomplete AB cache: {len(missing)} missing, e.g. {missing[:3]}')
+    data_manifest = excel.parent / 'manifest.json'
+    if not data_manifest.is_file() or json.loads(data_manifest.read_text()).get('source', {}).get('versionId') != info['versionId']:
+        raise ValueError('Data tables must have a matching source manifest')
+    output.mkdir(parents=True, exist_ok=False)
+    (output / 'cache').mkdir()
+    (output / 'excel').mkdir()
+    for name in sorted(expected | {'hashes.json'}):
+        shutil.copyfile(cache / name, output / 'cache' / name)
+    for name in ['skin_table.json', 'character_table.json']:
+        shutil.copyfile(excel / name, output / 'excel' / name)
+    for name in ['upstream.json', 'capture.json']:
+        if (cache.parent / name).is_file():
+            shutil.copyfile(cache.parent / name, output / name)
+    if (excel.parent / 'manifest.json').is_file():
+        shutil.copyfile(excel.parent / 'manifest.json', output / 'data-manifest.json')
+    files = inventory(output)
+    save(output / 'snapshot.json', {'versionId': info['versionId'], 'files': files,
+         'python': platform.python_version(),
+         'dependencies': sorted(f'{d.metadata["Name"]}=={d.version}' for d in importlib.metadata.distributions())})
+    return {'versionId': info['versionId'], 'files': len(files)}
+
+
+def verify_snapshot(root):
+    receipt = json.loads((root / 'snapshot.json').read_text())
+    actual = inventory(root)
+    actual.pop('snapshot.json')
+    if actual != receipt['files']:
+        raise ValueError('Snapshot bytes changed')
+    return receipt
+
+
+def build(snapshot, output, previous=None):
+    from akdp import images_extract, images_index, images_variants, images_package, images_state
+    receipt = verify_snapshot(snapshot)
+    dependencies = sorted(f'{d.metadata["Name"]}=={d.version}' for d in importlib.metadata.distributions())
+    if dependencies != receipt['dependencies'] or platform.python_version() != receipt['python']:
+        raise ValueError('Frozen toolchain differs from current environment')
+    start = time.monotonic()
+    output.mkdir(parents=True, exist_ok=False)
+    images = output / 'images'
+    images.mkdir()
+    stats = images_extract.extract_images(snapshot / 'cache', images, snapshot / 'excel')
+    if stats.failed:
+        raise ValueError(f'Extraction failures: {stats.failed}')
+    index, index_stats = images_index.generate_index(images, snapshot / 'excel', version_id=receipt['versionId'])
+    valid = images_extract._load_skin_ids(snapshot / 'excel')
+    missing = valid - set(index['artworks'])
+    if missing:
+        raise ValueError(f'Missing valid skins: {sorted(missing)[:20]}')
+    images_index.write_index_atomic(images / 'index.json', index)
+    variants = images_variants.generate_variants(images, images / 'index.json')
+    if variants.failed:
+        raise ValueError(f'Variant failures: {variants.failed}')
+    dist = output / 'dist'
+    final, package = images_package.package_images(images, dist, previous, receipt['versionId'])
+    hashes = json.loads((snapshot / 'cache' / 'hashes.json').read_text())['hashes']
+    state = images_state.build_next_state(None, version_id=receipt['versionId'], bundle_hashes=hashes,
+              processed_candidates=stats.bundle_candidates, valid_skin_ids=valid)
+    images_state.write_build_state(dist / images_state.BUILD_STATE_ASSET, state)
+    result = {'versionId': receipt['versionId'], 'snapshot_sha256': digest(snapshot / 'snapshot.json'),
+              'previous_index_sha256': digest(previous) if previous else None,
+              'seconds': time.monotonic() - start,
+              'factory_commit': subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip(),
+              'extract': stats.to_dict(),
+              'index': index_stats.to_dict(), 'package': package.to_dict(), 'assets': inventory(dist)}
+    save(output / 'build.json', result)
+    return result
+
+
+def members(index):
+    result = {}
+    for artwork in index['artworks'].values():
+        for variant in ['large', 'preview', 'original']:
+            if variant not in artwork:
+                continue
+            item = artwork[variant]
+            name = f"{artwork['shard']}/{item['file']}"
+            p = PurePosixPath(name)
+            if p.is_absolute() or '..' in p.parts or '\\' in name:
+                raise ValueError('Unsafe asset path')
+            metadata = {'bytes': item['bytes'], 'sha256': item['sha256']}
+            if name in result and result[name] != metadata:
+                raise ValueError('Conflicting asset path')
+            result[name] = metadata
+    return result
+
+
+def verify(dist):
+    index = json.loads((dist / 'index.json').read_text())
+    expected = members(index)
+    seen = {}
+    assets = {}
+    for path in sorted(dist.glob('*.zip')):
+        if path.stat().st_size >= 2 * 1024**3:
+            raise ValueError(f'Asset reaches 2 GiB: {path.name}')
+        with zipfile.ZipFile(path) as archive:
+            for entry in archive.infolist():
+                if entry.is_dir():
+                    continue
+                if entry.filename in seen:
+                    raise ValueError('Duplicate ZIP member')
+                h = hashlib.sha256()
+                with archive.open(entry) as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b''):
+                        h.update(block)
+                value = {'bytes': entry.file_size, 'sha256': h.hexdigest()}
+                if expected.get(entry.filename) != value:
+                    raise ValueError(f'ZIP/index mismatch: {entry.filename}')
+                seen[entry.filename] = value
+        assets[path.name] = {'bytes': path.stat().st_size, 'sha256': digest(path)}
+    if index['baselineVersion'] == index['currentVersion'] and seen != expected:
+        raise ValueError('Incomplete baseline')
+    if index['baselineVersion'] == index['currentVersion']:
+        if not set(index['shards'].values()).issubset(assets):
+            raise ValueError('Missing declared shard')
+    return {'files_verified': len(seen), 'assets': assets}
+
+
+def compare(left, right):
+    a, b = inventory(left), inventory(right)
+    a = {k: v for k, v in a.items() if k.endswith('.png')}
+    b = {k: v for k, v in b.items() if k.endswith('.png')}
+    return {'equal': a == b, 'left_only': sorted(a.keys() - b.keys()),
+            'right_only': sorted(b.keys() - a.keys()),
+            'changed': sorted(k for k in a.keys() & b.keys() if a[k] != b[k]),
+            'left_files': len(a), 'right_files': len(b)}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command', required=True)
+    p = sub.add_parser('freeze')
+    for name in ['cache', 'excel', 'output']:
+        p.add_argument('--' + name, type=Path, required=True)
+    p = sub.add_parser('build')
+    for name in ['snapshot', 'output']:
+        p.add_argument('--' + name, type=Path, required=True)
+    p.add_argument('--previous', type=Path)
+    p = sub.add_parser('verify')
+    p.add_argument('--dist', type=Path, required=True)
+    p = sub.add_parser('compare')
+    for name in ['left', 'right']:
+        p.add_argument('--' + name, type=Path, required=True)
+    args = vars(parser.parse_args())
+    command = args.pop('command')
+    print(json.dumps(globals()[command](**args), indent=2))
+
+
+if __name__ == '__main__':
+    main()
