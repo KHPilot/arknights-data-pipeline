@@ -16,6 +16,7 @@ class LabTests(unittest.TestCase):
         index = {'baselineVersion':'P','currentVersion':'P','shards':{'chararts-large':'a.zip'},
                  'artworks':{'a':{'shard':'chararts','large':{'file':'a.large.png','bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest()}}}}
         (root/'index.json').write_text(json.dumps(index))
+        (root/'images-build-state.json').write_text(json.dumps({'schemaVersion':'akdp-images-build-state/v1','versionId':'P'}))
         with zipfile.ZipFile(root/'a.zip','w') as z:z.writestr('a.large.png',raw)
         with zipfile.ZipFile(root/'images-delta-P.zip','w'):pass
         return index
@@ -63,7 +64,17 @@ class LabTests(unittest.TestCase):
             prior=root/'previous.json';prior.write_text(json.dumps(index))
             index['currentVersion']='Q';index['artworks']['a']['large']['sha256']='0'*64
             (root/'index.json').write_text(json.dumps(index));(root/'a.zip').unlink()
+            (root/'images-build-state.json').write_text(json.dumps({'schemaVersion':'akdp-images-build-state/v1','versionId':'Q'}))
             with self.assertRaises(ValueError):lab.verify(root)
             with self.assertRaises(ValueError):lab.verify(root,prior)
+
+    def test_delta_rejects_relabelled_extraction(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);dist=root/'dist';images=root/'images';dist.mkdir();images.mkdir()
+            index=self.candidate(dist)
+            lab.save(root/'build.json',{'versionId':'P','assets':lab.inventory(dist)})
+            index['currentVersion']='Q';(images/'index.json').write_text(json.dumps(index))
+            with self.assertRaisesRegex(ValueError,'versions differ'):
+                lab.delta(root,root/'unused-previous.json',root/'output')
 
 if __name__=='__main__':unittest.main()

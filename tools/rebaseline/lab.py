@@ -139,6 +139,9 @@ def members(index):
 
 def verify(dist, previous=None):
     index = json.loads((dist / 'index.json').read_text())
+    state = json.loads((dist / 'images-build-state.json').read_text())
+    if state.get('schemaVersion') != 'akdp-images-build-state/v1' or state.get('versionId') != index['currentVersion']:
+        raise ValueError('Build state version differs from index')
     expected = members(index)
     required = expected
     if index['baselineVersion'] != index['currentVersion']:
@@ -199,8 +202,19 @@ def verify(dist, previous=None):
 def delta(full_build, previous, output):
     """Package P->L from a verified full L extraction, without re-decoding ABs."""
     from akdp.images_package import package_images
+    receipt = json.loads((full_build / 'build.json').read_text())
+    for name in ['index.json', 'images-build-state.json']:
+        path = full_build / 'dist' / name
+        if {'bytes': path.stat().st_size, 'sha256': digest(path)} != receipt['assets'][name]:
+            raise ValueError('Full-build asset differs from receipt')
+    source_index = json.loads((full_build / 'dist' / 'index.json').read_text())
+    source_state = json.loads((full_build / 'dist' / 'images-build-state.json').read_text())
     images = full_build / 'images'
     index = json.loads((images / 'index.json').read_text())
+    if not (receipt['versionId'] == source_index['currentVersion'] == source_state['versionId'] == index['currentVersion']):
+        raise ValueError('Full-build versions differ')
+    if members(index) != members(source_index):
+        raise ValueError('Extraction index differs from full-build index')
     expected = members(index)
     actual = {k: v for k, v in inventory(images).items() if k.endswith('.png')}
     if actual != expected:
