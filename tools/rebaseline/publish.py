@@ -8,8 +8,8 @@ import sys
 from lab import digest, verify
 
 
-def run(args, env):
-    return subprocess.check_output(['gh', *args], env=env, text=True)
+def run(args, env, input_text=None):
+    return subprocess.check_output(['gh', *args], env=env, text=True, input=input_text)
 
 
 def main():
@@ -43,10 +43,9 @@ def main():
     if args.stage=='draft':
         if existing and not existing['draft']:raise ValueError('Release is already public')
         if existing is None:
-            run(['release','create',tag,'-R',args.repo,'--draft','--latest=false','--title',tag,
-                 '--notes','Isolated re-baseline experiment candidate.'],env)
-            pages = json.loads(run(['api','--paginate','--slurp',f'repos/{args.repo}/releases?per_page=100'],env))
-            existing = next(r for page in pages for r in page if r['tag_name'] == tag)
+            existing = json.loads(run(['api','--method','POST',f'repos/{args.repo}/releases','--input','-'], env,
+                json.dumps({'tag_name':tag, 'draft':True, 'make_latest':'false', 'name':tag,
+                            'body':'Isolated re-baseline experiment candidate.'})))
         assets={a['name']:a for a in existing['assets']}
         for path in files:
             if path.name in assets:
