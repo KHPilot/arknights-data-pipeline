@@ -9,7 +9,7 @@ from lab import digest
 from sharding import atomic_json, verify
 
 
-def publish(dist, repo, credential_ssh, previous=None):
+def publish(dist, repo, credential_ssh, previous=None, fault=None):
     verify(dist, previous)
     token = subprocess.check_output(['ssh', '-o', 'BatchMode=yes', credential_ssh, 'gh auth token'], text=True).strip()
     env = dict(os.environ, GH_TOKEN=token); env.pop('GITHUB_TOKEN', None)
@@ -51,15 +51,23 @@ def publish(dist, repo, credential_ssh, previous=None):
         if set(existing) - set(names): raise ValueError('unexpected remote assets')
         for name in names:
             file = dist/name
+            if name in existing and existing[name].get('state') == 'starter':
+                if not release['draft']: raise ValueError('starter asset on public release')
+                gh(['api', '--method', 'DELETE', f"repos/{repo}/releases/assets/{existing[name]['id']}"])
+                existing = assets()
             if name not in existing:
                 if not release['draft']: raise ValueError('incomplete public release')
                 # Upload responses are not JSON. Reconcile an ambiguous successful upload before retry.
                 for attempt in range(3):
                     p = subprocess.run(['gh', 'release', 'upload', release['tag_name'], '-R', repo, str(file)], env=env, text=True, capture_output=True)
                     existing = assets()
-                    if name in existing: break
+                    if name in existing and existing[name].get('state') != 'starter': break
+                    if name in existing:
+                        gh(['api', '--method', 'DELETE', f"repos/{repo}/releases/assets/{existing[name]['id']}"])
+                        existing = assets()
                     if attempt == 2: raise RuntimeError(p.stderr)
                     time.sleep([5, 20][attempt])
+            if fault == 'after_upload': raise RuntimeError('injected interruption after upload')
             a = existing[name]
             if a['size'] != file.stat().st_size or a.get('digest') != 'sha256:' + digest(file):
                 raise ValueError('remote content mismatch')
@@ -71,6 +79,8 @@ def publish(dist, repo, credential_ssh, previous=None):
         if release['draft'] or release['tag_name'] != tag: raise ValueError('activation failed')
         receipt = {'repo': repo, 'tag': tag, 'release_id': release['id'], 'state': 'public', 'assets': len(names)}
         atomic_json(path, receipt); records.append(receipt)
+        if fault == 'after_baseline' and tag.startswith('images2-baseline-'):
+            raise RuntimeError('injected interruption after baseline activation')
     return records
 
 if __name__ == '__main__':
