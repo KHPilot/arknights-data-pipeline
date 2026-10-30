@@ -45,14 +45,17 @@ def main():
         if existing is None:
             run(['release','create',tag,'-R',args.repo,'--draft','--latest=false','--title',tag,
                  '--notes','Isolated re-baseline experiment candidate.'],env)
-            existing=json.loads(run(['api',f'repos/{args.repo}/releases/tags/{tag}'],env))
+            pages = json.loads(run(['api','--paginate','--slurp',f'repos/{args.repo}/releases?per_page=100'],env))
+            existing = next(r for page in pages for r in page if r['tag_name'] == tag)
         assets={a['name']:a for a in existing['assets']}
         for path in files:
             if path.name in assets:
                 if assets[path.name].get('digest')!='sha256:'+digest(path):raise ValueError('Existing asset differs')
             else:
                 run(['release','upload',tag,'-R',args.repo,str(path)],env)
-    existing=json.loads(run(['api',f'repos/{args.repo}/releases/tags/{tag}'],env))
+    if existing is None:
+        raise ValueError('Release does not exist')
+    existing=json.loads(run(['api',f"repos/{args.repo}/releases/{existing['id']}"],env))
     assets={a['name']:a for a in existing['assets']}
     if set(assets)!=set(names):raise ValueError('Release asset set differs')
     for path in files:

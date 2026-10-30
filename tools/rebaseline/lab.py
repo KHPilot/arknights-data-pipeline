@@ -195,6 +195,29 @@ def verify(dist, previous=None):
     return {'files_verified': len(seen), 'assets': assets}
 
 
+
+def delta(full_build, previous, output):
+    """Package P->L from a verified full L extraction, without re-decoding ABs."""
+    from akdp.images_package import package_images
+    images = full_build / 'images'
+    index = json.loads((images / 'index.json').read_text())
+    expected = members(index)
+    actual = {k: v for k, v in inventory(images).items() if k.endswith('.png')}
+    if actual != expected:
+        raise ValueError('Full extraction differs from its index')
+    prior = json.loads(previous.read_text())
+    if prior['currentVersion'] >= index['currentVersion']:
+        raise ValueError('Delta must advance the version')
+    output.mkdir(parents=True, exist_ok=False)
+    package_images(images, output, previous, index['currentVersion'])
+    shutil.copyfile(full_build / 'dist' / 'images-build-state.json', output / 'images-build-state.json')
+    result = verify(output, previous)
+    result.update({'full_build_receipt_sha256': digest(full_build / 'build.json'),
+                   'previous_index_sha256': digest(previous)})
+    save(output.parent / (output.name + '-receipt.json'), result)
+    return result
+
+
 def compare(left, right):
     if not left.is_dir() or not right.is_dir():
         raise ValueError('Comparison requires two existing directories')
@@ -222,6 +245,9 @@ def main():
     p = sub.add_parser('verify')
     p.add_argument('--dist', type=Path, required=True)
     p.add_argument('--previous', type=Path)
+    p = sub.add_parser('delta')
+    for name in ['full-build', 'previous', 'output']:
+        p.add_argument('--' + name, type=Path, required=True)
     p = sub.add_parser('compare')
     for name in ['left', 'right']:
         p.add_argument('--' + name, type=Path, required=True)
