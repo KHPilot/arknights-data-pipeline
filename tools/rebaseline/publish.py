@@ -16,11 +16,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--repo', required=True)
     p.add_argument('--dist', required=True, type=Path)
+    p.add_argument('--previous', type=Path)
     p.add_argument('--kind', choices=['baseline','delta'], required=True)
     p.add_argument('--stage', choices=['draft','verify','activate'], required=True)
     p.add_argument('--credential-ssh', required=True)
     args = p.parse_args()
-    verify(args.dist)
+    verify(args.dist, args.previous)
     token = subprocess.check_output(['ssh','-o','BatchMode=yes',args.credential_ssh,'gh auth token'], text=True).strip()
     env = {**os.environ, 'GH_TOKEN':token}
     env.pop('GITHUB_TOKEN',None)

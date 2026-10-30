@@ -16,14 +16,15 @@ class LabTests(unittest.TestCase):
         index = {'baselineVersion':'P','currentVersion':'P','shards':{'chararts-large':'a.zip'},
                  'artworks':{'a':{'shard':'chararts','large':{'file':'a.large.png','bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest()}}}}
         (root/'index.json').write_text(json.dumps(index))
-        with zipfile.ZipFile(root/'a.zip','w') as z:z.writestr('chararts/a.large.png',raw)
+        with zipfile.ZipFile(root/'a.zip','w') as z:z.writestr('a.large.png',raw)
+        with zipfile.ZipFile(root/'images-delta-P.zip','w'):pass
         return index
 
     def test_baseline_complete_and_corruption(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);self.candidate(root)
             self.assertEqual(lab.verify(root)['files_verified'],1)
-            with zipfile.ZipFile(root/'a.zip','w') as z:z.writestr('chararts/a.large.png',b'bad')
+            with zipfile.ZipFile(root/'a.zip','w') as z:z.writestr('a.large.png',b'bad')
             with self.assertRaisesRegex(ValueError,'mismatch'):lab.verify(root)
 
     def test_missing_baseline_and_duplicate(self):
@@ -31,7 +32,7 @@ class LabTests(unittest.TestCase):
             root=Path(d);self.candidate(root)
             import shutil
             shutil.copyfile(root/'a.zip',root/'b.zip')
-            with self.assertRaisesRegex(ValueError,'Duplicate'):lab.verify(root)
+            with self.assertRaises(ValueError):lab.verify(root)
             (root/'b.zip').unlink();(root/'a.zip').unlink()
             with self.assertRaisesRegex(ValueError,'Incomplete'):lab.verify(root)
 
@@ -51,5 +52,18 @@ class LabTests(unittest.TestCase):
             lab.verify_snapshot(root)
             (root/'a').write_bytes(b'b')
             with self.assertRaisesRegex(ValueError,'changed'):lab.verify_snapshot(root)
+
+    def test_nonexistent_comparison_is_not_equality(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError):lab.compare(Path(d)/'missing',Path(d)/'other')
+
+    def test_missing_delta_is_not_valid(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);index=self.candidate(root)
+            prior=root/'previous.json';prior.write_text(json.dumps(index))
+            index['currentVersion']='Q';index['artworks']['a']['large']['sha256']='0'*64
+            (root/'index.json').write_text(json.dumps(index));(root/'a.zip').unlink()
+            with self.assertRaises(ValueError):lab.verify(root)
+            with self.assertRaises(ValueError):lab.verify(root,prior)
 
 if __name__=='__main__':unittest.main()

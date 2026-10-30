@@ -80,11 +80,16 @@ def build(snapshot, output, previous=None):
     dependencies = sorted(f'{d.metadata["Name"]}=={d.version}' for d in importlib.metadata.distributions())
     if dependencies != receipt['dependencies'] or platform.python_version() != receipt['python']:
         raise ValueError('Frozen toolchain differs from current environment')
+    source_root = Path(__file__).resolve().parents[2]
+    source_id = {'commit': subprocess.check_output(['git','-C',str(source_root),'rev-parse','HEAD'], text=True).strip(),
+                 'lab_sha256': digest(Path(__file__)),
+                 'source_diff_sha256': hashlib.sha256(subprocess.check_output(['git','-C',str(source_root),'diff','HEAD'])).hexdigest()}
     start = time.monotonic()
     output.mkdir(parents=True, exist_ok=False)
     images = output / 'images'
     images.mkdir()
-    stats = images_extract.extract_images(snapshot / 'cache', images, snapshot / 'excel')
+    hashes = json.loads((snapshot / 'cache' / 'hashes.json').read_text())['hashes']
+    stats = images_extract.extract_images(snapshot / 'cache', images, snapshot / 'excel', set(hashes))
     if stats.failed:
         raise ValueError(f'Extraction failures: {stats.failed}')
     index, index_stats = images_index.generate_index(images, snapshot / 'excel', version_id=receipt['versionId'])
@@ -101,11 +106,13 @@ def build(snapshot, output, previous=None):
     hashes = json.loads((snapshot / 'cache' / 'hashes.json').read_text())['hashes']
     state = images_state.build_next_state(None, version_id=receipt['versionId'], bundle_hashes=hashes,
               processed_candidates=stats.bundle_candidates, valid_skin_ids=valid)
+    if set(state.bundle_candidates) != set(hashes):
+        raise ValueError('Build state lost bundle provenance')
     images_state.write_build_state(dist / images_state.BUILD_STATE_ASSET, state)
     result = {'versionId': receipt['versionId'], 'snapshot_sha256': digest(snapshot / 'snapshot.json'),
               'previous_index_sha256': digest(previous) if previous else None,
               'seconds': time.monotonic() - start,
-              'factory_commit': subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip(),
+              'factory_commit': source_id,
               'extract': stats.to_dict(),
               'index': index_stats.to_dict(), 'package': package.to_dict(), 'assets': inventory(dist)}
     save(output / 'build.json', result)
@@ -119,7 +126,7 @@ def members(index):
             if variant not in artwork:
                 continue
             item = artwork[variant]
-            name = f"{artwork['shard']}/{item['file']}"
+            name = item['file']
             p = PurePosixPath(name)
             if p.is_absolute() or '..' in p.parts or '\\' in name:
                 raise ValueError('Unsafe asset path')
@@ -130,15 +137,42 @@ def members(index):
     return result
 
 
-def verify(dist):
+def verify(dist, previous=None):
     index = json.loads((dist / 'index.json').read_text())
     expected = members(index)
+    required = expected
+    if index['baselineVersion'] != index['currentVersion']:
+        if previous is None:
+            raise ValueError('Delta validation requires previous index')
+        from akdp.images_diff import compute_delta
+        prior = json.loads(previous.read_text())
+        if prior['baselineVersion'] != index['baselineVersion'] or prior['currentVersion'] >= index['currentVersion']:
+            raise ValueError('Delta predecessor does not match chain')
+        delta = compute_delta(index, prior)
+        required = members({'artworks': {k: index['artworks'][k] for k in delta['added'] | delta['changed']}})
+    delta_asset = dist / f"images-delta-{index['currentVersion']}.zip"
+    if not delta_asset.is_file():
+        raise ValueError('Missing delta/sentinel ZIP')
     seen = {}
     assets = {}
     for path in sorted(dist.glob('*.zip')):
         if path.stat().st_size >= 2 * 1024**3:
             raise ValueError(f'Asset reaches 2 GiB: {path.name}')
+        assigned = required
+        if index['baselineVersion'] == index['currentVersion']:
+            keys = [k for k, v in index['shards'].items() if v == path.name]
+            if len(keys) == 1:
+                shard, tier = keys[0].rsplit('-', 1)
+                assigned = {a[tier]['file']: expected[a[tier]['file']] for a in index['artworks'].values() if a['shard'] == shard and tier in a}
+            elif path.name == f"images-delta-{index['currentVersion']}.zip":
+                assigned = {}
+            else:
+                raise ValueError('Unexpected or ambiguous baseline ZIP')
+        elif path.name != f"images-delta-{index['currentVersion']}.zip":
+            raise ValueError('Unexpected delta ZIP')
         with zipfile.ZipFile(path) as archive:
+            if {e.filename for e in archive.infolist() if not e.is_dir()} != set(assigned):
+                raise ValueError('ZIP shard membership differs')
             for entry in archive.infolist():
                 if entry.is_dir():
                     continue
@@ -153,8 +187,8 @@ def verify(dist):
                     raise ValueError(f'ZIP/index mismatch: {entry.filename}')
                 seen[entry.filename] = value
         assets[path.name] = {'bytes': path.stat().st_size, 'sha256': digest(path)}
-    if index['baselineVersion'] == index['currentVersion'] and seen != expected:
-        raise ValueError('Incomplete baseline')
+    if seen != required:
+        raise ValueError('Incomplete baseline or delta membership differs')
     if index['baselineVersion'] == index['currentVersion']:
         if not set(index['shards'].values()).issubset(assets):
             raise ValueError('Missing declared shard')
@@ -162,9 +196,13 @@ def verify(dist):
 
 
 def compare(left, right):
+    if not left.is_dir() or not right.is_dir():
+        raise ValueError('Comparison requires two existing directories')
     a, b = inventory(left), inventory(right)
     a = {k: v for k, v in a.items() if k.endswith('.png')}
     b = {k: v for k, v in b.items() if k.endswith('.png')}
+    if not a or not b:
+        raise ValueError('Comparison requires nonempty PNG inventories')
     return {'equal': a == b, 'left_only': sorted(a.keys() - b.keys()),
             'right_only': sorted(b.keys() - a.keys()),
             'changed': sorted(k for k in a.keys() & b.keys() if a[k] != b[k]),
@@ -183,6 +221,7 @@ def main():
     p.add_argument('--previous', type=Path)
     p = sub.add_parser('verify')
     p.add_argument('--dist', type=Path, required=True)
+    p.add_argument('--previous', type=Path)
     p = sub.add_parser('compare')
     for name in ['left', 'right']:
         p.add_argument('--' + name, type=Path, required=True)
