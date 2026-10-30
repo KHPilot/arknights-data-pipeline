@@ -20,6 +20,7 @@ def main():
     p.add_argument('--kind', choices=['baseline','delta'], required=True)
     p.add_argument('--stage', choices=['draft','verify','activate'], required=True)
     p.add_argument('--credential-ssh', required=True)
+    p.add_argument('--release-id', type=int)
     args = p.parse_args()
     verify(args.dist, args.previous)
     token = subprocess.check_output(['ssh','-o','BatchMode=yes',args.credential_ssh,'gh auth token'], text=True).strip()
@@ -38,8 +39,14 @@ def main():
     for path in files:
         if not path.is_file():raise ValueError('Missing asset '+path.name)
     # List endpoint distinguishes an absent tag from auth/network failures.
-    pages = run(['api','--paginate','--slurp',f'repos/{args.repo}/releases?per_page=100'],env)
-    existing = next((r for page in json.loads(pages) for r in page if r['tag_name']==tag),None)
+    if args.release_id is not None:
+        existing = json.loads(run(['api',f'repos/{args.repo}/releases/{args.release_id}'],env))
+        renamed_draft = existing['draft'] and existing['tag_name'].startswith('untagged-') and existing['name'] == tag
+        if existing['tag_name'] != tag and not renamed_draft:
+            raise ValueError('Release ID does not identify the requested candidate')
+    else:
+        pages = run(['api','--paginate','--slurp',f'repos/{args.repo}/releases?per_page=100'],env)
+        existing = next((r for page in json.loads(pages) for r in page if r['tag_name']==tag),None)
     if args.stage=='draft':
         if existing and not existing['draft']:raise ValueError('Release is already public')
         if existing is None:
@@ -51,7 +58,7 @@ def main():
             if path.name in assets:
                 if assets[path.name].get('digest')!='sha256:'+digest(path):raise ValueError('Existing asset differs')
             else:
-                run(['release','upload',tag,'-R',args.repo,str(path)],env)
+                run(['release','upload',existing['tag_name'],'-R',args.repo,str(path)],env)
     if existing is None:
         raise ValueError('Release does not exist')
     existing=json.loads(run(['api',f"repos/{args.repo}/releases/{existing['id']}"],env))
@@ -62,7 +69,10 @@ def main():
         if a['size']!=path.stat().st_size or a.get('digest')!='sha256:'+digest(path):
             raise ValueError('Remote asset mismatch '+path.name)
     if args.stage=='activate':
-        run(['release','edit',tag,'-R',args.repo,'--draft=false','--latest=false'],env)
-    print(json.dumps({'repo':args.repo,'tag':tag,'stage':args.stage,'assets_verified':len(files)}))
+        published = json.loads(run(['api','--method','PATCH',f"repos/{args.repo}/releases/{existing['id']}",'--input','-'],env,
+            json.dumps({'tag_name':tag,'target_commitish':existing['target_commitish'],'draft':False,'make_latest':'false'})))
+        if published['draft'] or published['tag_name'] != tag:
+            raise ValueError('Release activation was not confirmed')
+    print(json.dumps({'repo':args.repo,'tag':tag,'stage':args.stage,'assets_verified':len(files),'release_id':existing['id']}))
 
 if __name__=='__main__':main()
